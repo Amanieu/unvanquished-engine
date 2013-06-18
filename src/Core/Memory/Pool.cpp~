@@ -1,0 +1,209 @@
+//@@COPYRIGHT@@
+
+// Memory pool of fixed-length objects, inspired by the Linux SLAB allocator
+
+// To access the structs
+using namespace MemPoolImpl;
+
+// Special value for the next pointer of a block, when it belong to a thread.
+#define THREAD_BLOCK reinterpret_cast<List<memBlock_t>::node_ptr>(-1)
+
+// Maximum number of blocks the free block list can hold before blocks are freed
+// back to the operating system.
+#define MAX_FREE_BLOCKS 64
+
+// Global free block list
+static LFList<freeItem_t> freeBlockList;
+ 
+// Get the base block pointer from an object inside it
+static inline void *BaseFromPtr(void *ptr)
+{
+	return reinterpret_cast<void *>(reinterpret_cast<intptr_t>(ptr) & ~(MemPoolImpl::BLOCK_SIZE - 1));
+}
+
+// Convert between a memBlock_t pointer and a base block pointer
+static inline void *BaseFromBlock(memBlock_t *block)
+{
+	return BaseFromPtr(block);
+}
+static inline memBlock_t *BlockFromBase(void *base)
+{
+	return reinterpret_cast<memBlock_t *>(static_cast<char *>(base) + MemPoolImpl::BLOCK_SIZE - sizeof(memBlock_t));
+}
+
+// Get the memBlock_t from an object inside the block
+static inline memBlock_t *BlockFromPtr(void *ptr)
+{
+	return BlockFromBase(BaseFromPtr(ptr));
+}
+
+// Mark a block as a thread block. Set value to true to mark or false to unmark.
+static inline void MarkThreadBlock(memBlock_t *block, bool value)
+{
+	List<memBlock_t>::node_ptr node = List<memBlock_t>::value_traits::to_node_ptr(*block);
+	List<memBlock_t>::node_traits::set_next(node, value ? THREAD_BLOCK : NULL);
+}
+
+// Check if a block is a thread block
+static inline bool IsThreadBlock(memBlock_t *block)
+{
+	List<memBlock_t>::node_ptr node = List<memBlock_t>::value_traits::to_node_ptr(*block);
+	return List<memBlock_t>::node_traits::get_next(node) == THREAD_BLOCK;
+}
+
+void *MemPoolImpl::Alloc(size_t objSize, blockLists_t &blockLists, threadData_t &threadData)
+{
+	void *ptr;
+	memBlock_t *block;
+
+	// Try fast paths first
+	if (threadData.threadBlock) {
+		// Fast path 1: attempt to reap directly from block
+		if (threadData.reapStart && threadData.reapStart <= static_cast<char *>(BaseFromBlock(threadData.threadBlock)) + BLOCK_SIZE - sizeof(memBlock_t) - objSize) {
+			void *ptr = threadData.reapStart;
+			threadData.reapStart = static_cast<char *>(threadData.reapStart) + objSize;
+			return ptr;
+		}
+
+		// Fast path 2: attempt to allocate from per-thread free list
+		void *ptr = SList<freeItem_t>::value_traits::to_value_ptr(threadData.freeList);
+		if (ptr) {
+			threadData.freeList = SList<freeItem_t>::node_traits::get_next(threadData.freeList);
+			return ptr;
+		}
+
+		// Try to get the free list from our per-thread block:
+		// Other threads may have freed something in it.
+		block = threadData.threadBlock;
+		SList<freeItem_t> list;
+		block->lock.Lock();
+		list.swap(block->freeList);
+		block->numFree = 0;
+		if (list.empty()) {
+			// The block is now full, so unmark it and get a new one
+			MarkThreadBlock(block, false);
+			block->lock.Unlock();
+		} else {
+			block->lock.Unlock();
+			ptr = &list.front();
+			list.pop_front();
+			threadData.freeList = list.begin().pointed_node();
+			return ptr;
+		}
+	}
+
+	// Couldn't allocate from thread block, either because we don't have a block
+	// or it is full. Get a new block from the partial list and load its free
+	// list.
+	blockLists.lock.Lock();
+	//blockLists.partial.size();
+	foreach (memBlock_t &blk, blockLists.partial) {
+		block = &blk;
+		if (!block->lock.TryLock())
+			continue;
+		blockLists.partial.erase(blockLists.partial.iterator_to(*block));
+		//blockLists.partial.size();
+		blockLists.lock.Unlock();
+		MarkThreadBlock(block, true);
+		SList<freeItem_t> list;
+		list.swap(block->freeList);
+		block->numFree = 0;
+		block->lock.Unlock();
+		ptr = &list.front();
+		list.pop_front();
+		threadData.freeList = list.begin().pointed_node();
+		threadData.threadBlock = block;
+		threadData.reapStart = NULL;
+		return ptr;
+	}
+	//blockLists.partial.size();
+	blockLists.lock.Unlock();
+
+	// The partial list is empty, so we try to get a block from the free list.
+	// If that fails, allocate a new block.
+	void *base = freeBlockList.Pop();
+	if (!base)
+		base = MemVirtual::AllocBlock();
+	block = new(BlockFromBase(base)) memBlock_t;
+	MarkThreadBlock(block, true);
+	block->objSize = objSize;
+	block->numFree = 0;
+	threadData.reapStart = static_cast<char *>(base) + objSize;
+	threadData.threadBlock = block;
+
+	// Return the first item of the block
+	return base;
+}
+
+void MemPoolImpl::Free(void *ptr, int maxObjs, blockLists_t &blockLists, threadData_t &threadData)
+{
+	// Get the block this pointer belongs to.
+	void *base = BaseFromPtr(ptr);
+	memBlock_t *block = BlockFromBase(base);
+
+	// If it belongs to the current thread block, then just send it to our free
+	// list.
+	if (block == threadData.threadBlock) {
+		SList<freeItem_t>::node_ptr item = SList<freeItem_t>::value_traits::to_node_ptr(*static_cast<freeItem_t *>(ptr));
+		SList<freeItem_t>::node_traits::set_next(item, threadData.freeList);
+		threadData.freeList = item;
+		return;
+	}
+
+	// Lock the block
+	block->lock.Lock();
+
+	// Add to the block's free list
+	block->freeList.push_front(*static_cast<freeItem_t *>(ptr));
+	block->numFree++;
+
+	// Do nothing if a thread block
+	if (IsThreadBlock(block)) {
+		block->lock.Unlock();
+		return;
+	}
+
+	// If the block was full, move it back into the partial list
+	if (block->numFree == 1) {
+		blockLists.lock.Lock();
+		//blockLists.partial.size();
+		blockLists.partial.push_front(*block);
+		//blockLists.partial.size();
+		block->lock.Unlock();
+		blockLists.lock.Unlock();
+		return;
+	}
+
+	// If the block is now empty, release it
+	else if (block->numFree == maxObjs) {
+		blockLists.lock.Lock();
+		//blockLists.partial.size();
+		blockLists.partial.erase(blockLists.partial.iterator_to(*block));
+		//blockLists.partial.size();
+		blockLists.lock.Unlock();
+
+		// Free the block to the operating system if the free block list is
+		// full. This check isn't thread-safe but it is OK to have a few
+		// more blocks than MAX_FREE_BLOCKS.
+		if (freeBlockList.Length() >= MAX_FREE_BLOCKS)
+			MemVirtual::FreeBlock(base);
+		else
+			freeBlockList.Push(*reinterpret_cast<freeItem_t *>(base));
+		return;
+	}
+
+	// Unlock the block
+	block->lock.Unlock();
+}
+
+void MemPoolImpl::FreeBlock(memBlock_t *block)
+{
+	if (block)
+		MemVirtual::FreeBlock(BaseFromBlock(block));
+}
+
+size_t MemPoolImpl::GetObjSize(void *ptr)
+{
+	memBlock_t *block = BlockFromPtr(ptr);
+	return block->objSize;
+}

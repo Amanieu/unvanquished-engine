@@ -1,0 +1,444 @@
+#########################
+# Unvanquished Makefile #
+#########################
+
+#############################################################################
+# CONFIGURATION
+#
+# If you require a different configuration from the defaults below, create a
+# new file named "Makefile.local" in the same directory as this file and define
+# your parameters there. This allows you to change configuration without
+# causing problems with keeping up to date with the repository.
+#############################################################################
+-include Makefile.local
+
+ifeq ($(TARGET), server)
+  USE_CURSES ?= 1
+else
+  USE_CURSES ?= 0
+endif
+
+# Only used on x86 and x86_64
+USE_SSE ?= 2
+
+# Only used on ppc32
+USE_ALTIVEC ?= 1
+
+# Whether to build a dll
+BUILD_DLL = 0
+ifeq ($(TARGET), game)
+  BUILD_DLL = 1
+endif
+
+#############################################################################
+# VERSION
+#############################################################################
+
+VERSION_NUMBER = 0.0.0
+
+# For svn
+ifeq ($(wildcard .svn), .svn)
+  SVN_REV = $(shell LANG=C svnversion .)
+  ifneq ($(SVN_REV), )
+    VERSION = $(VERSION_NUMBER)_$(SVN_REV)
+    VERSION_DEP = .svn/entries
+  endif
+# For git-svn
+else ifeq ($(wildcard .git/svn/.metadata), .git/svn/.metadata)
+  GITSVN_REV = $(shell LANG=C git svn info | awk '$$1 == "Revision:" {print $$2; exit 0}')
+  ifneq ($(GITSVN_REV), )
+    VERSION = $(VERSION_NUMBER)_$(GITSVN_REV)
+    VERSION_DEP = .git/svn/.metadata
+  endif
+# For git
+else ifeq ($(wildcard .git), .git)
+  GIT_REV = $(shell LANG=C git show-ref -h -s --abbrev | head -n1)
+  ifneq ($(GIT_REV), )
+    VERSION = $(VERSION_NUMBER)_$(GIT_REV)
+    VERSION_DEP = .git/index
+  endif
+# For hg
+else ifeq ($(wildcard .hg), .hg)
+  HG_REV = $(shell LANG=C hg id -n)
+  ifneq ($(HG_REV), )
+    VERSION = $(VERSION_NUMBER)_$(HG_REV)
+    VERSION_DEP = .hg/dirstate
+  endif
+# For other
+else
+  VERSION = $(VERSION_NUMBER)
+  VERSION_DEP = 
+endif
+
+#############################################################################
+# LIBRARIES
+#
+# Override these if not using the system default
+#############################################################################
+
+pkgconfig_cflags = $(shell if ! pkg-config --cflags $(1) 2> /dev/null; then echo "$(2)"; fi)
+pkgconfig_cflags2 = $(shell if ! pkg-config --cflags $(1) 2> /dev/null; then if which $(2) 2> /dev/null; then $(2) --cflags 2> /dev/null; else echo "$(3)" fi; fi)
+pkgconfig_libs = $(shell if ! pkg-config --libs $(1) 2> /dev/null; then echo "$(2)"; fi)
+pkgconfig_libs2 = $(shell if ! pkg-config --libs $(1) 2> /dev/null; then if which $(2) 2> /dev/null; then $(2) 2> /dev/null; else echo "$(3)"; fi; fi)
+
+# SDL
+SDL_CFLAGS ?= $(call pkgconfig_cflags2, sdl-config, sdl, )
+SDL_LIBS ?= $(call pkgconfig_libs2, sdl-config, sdl, -lSDL)
+
+# OpenGL
+GL_CFLAGS ?= $(call pkgconfig_cflags, gl)
+GL_LIBS ?= $(call pkgconfig_libs, gl, -lGL)
+
+# wxWidgets
+WX_CFLAGS ?= $(shell wx-config --cxxflags)
+WX_LIBS ?= $(shell wx-config --libs --gl-libs)
+
+# NCurses
+CURSES_CFLAGS ?=
+CURSES_LIBS ?= -lncurses
+
+# Boost test
+BOOST_TEST_CFLAGS ?=
+BOOST_TEST_LIBS ?= -static -lboost_unit_test_framework
+
+#############################################################################
+# COMPILE FLAGS
+#############################################################################
+
+CFLAGS += -std=gnu++11 -Wall -Wextra -pipe -g3 -fno-common
+DFLAGS += -D_GNU_SOURCE -DNDEBUG
+LDFLAGS += -Wl,--warn-common -Wl,--as-needed
+
+# So "#include <Main.h>" will pick up the precompiled header
+DFLAGS += -I $(B)
+
+# Include externals, treat them as system headers to quiet warnings
+DFLAGS += -isystem externals
+
+# Set default symbol visibility to hidden, not applicable to win32
+ifneq ($(PLATFORM), mingw32)
+  CFLAGS += -fvisibility=hidden
+endif
+
+# Target-specific flags
+ifeq ($(TARGET), engine)
+  DFLAGS += -DBUILD_ENGINE
+else ifeq ($(TARGET), game)
+  DFLAGS += -DBUILD_GAME
+else ifeq ($(TARGET), server)
+  DFLAGS += -DBUILD_SERVER
+else ifeq ($(TARGET), editor)
+  DFLAGS += -DBUILD_EDITOR
+else ifeq ($(TARGET), test)
+  DFLAGS += -DBUILD_TEST
+endif
+
+ifeq ($(BUILD_MODULE), 1)
+  DFLAGS += -DBUILD_MODULE
+endif
+
+# Architecture-specific flags
+ifeq ($(ARCH), x86_64)
+  ifeq ($(USE_SSE), 3)
+    CFLAGS += -march=nocona -msse3 -mtune=generic -mfpmath=sse -m64 -mcx16
+  else
+    CFLAGS += -msse2 -mtune=generic -mfpmath=sse -m64 -mcx16
+  endif
+else ifeq ($(ARCH), x86)
+  ifeq ($(USE_SSE), 3)
+    CFLAGS += -march=prescott -msse3 -mtune=generic -mfpmath=sse -m32
+  else ifeq ($(USE_SSE), 2)
+    CFLAGS += -march=pentium4 -msse2 -mtune=generic -mfpmath=sse -m32
+  else ifeq ($(USE_SSE), 1)
+    CFLAGS += -march=pentium3 -msse -mtune=generic -mfpmath=sse -m32
+  else
+    CFLAGS += -march=pentium -mtune=generic -mfpmath=387 -m32
+  endif
+else ifeq ($(ARCH), ppc)
+  ifeq ($(USE_ALTIVEC), 1)
+    CFLAGS += -mcpu=G4 -maltivec -m32
+  else
+    CFLAGS += -mcpu=G3 -m32
+  endif
+else ifeq ($(ARCH), ppc64)
+  CFLAGS += -mcpu=G5 -maltivec -m64
+else ifeq ($(ARCH), sparc)
+  CFLAGS += -mcpu=ultrasparc -mtune=ultrasparc3 -mv8plus
+endif
+
+# Special options for shlibs on ELF systems
+ifeq ($(BUILD_MODULE), 1)
+  ifneq ($(PLATFORM), mingw32)
+    ifneq ($(PLATFORM), darwin)
+      ifneq ($(ARCH), x86)
+        CFLAGS += -fpic
+      endif
+      LDFLAGS += -Wl,-Bsymbolic
+    endif
+  endif
+endif
+
+# Optimization control
+ifeq ($(DEBUG), 1)
+  CFLAGS += -O0 -ffast-math -fstrict-aliasing
+  DFLAGS += -DDEBUG
+else
+  CFLAGS += -O3 -fomit-frame-pointer -ffast-math
+endif
+
+#############################################################################
+# LIBRARY FLAGS
+#############################################################################
+
+# Curses console
+ifneq ($(BUILD_MODULE), 1)
+  ifeq ($(USE_CURSES), 1)
+    DFLAGS += -DUSE_CURSES
+    CFLAGS += $(CURSES_CFLAGS)
+    LDFLAGS += $(CURSES_LIBS)
+  endif
+endif
+
+# Engine libs
+ifeq ($(TARGET), game)
+  CFLAGS += $(SDL_CFLAGS) $(GL_CFLAGS)
+  LDFLAGS += $(SDL_LIBS) $(GL_LIBS)
+endif
+
+# Editor libs
+ifeq ($(TARGET), editor)
+  CFLAGS += $(WX_CFLAGS) $(GL_CFLAGS)
+  LDFLAGS += $(WX_LIBS) $(GL_LIBS)
+endif
+
+# Test libs
+ifeq ($(TARGET), test)
+  CFLAGS += $(BOOST_TEST_CFLAGS)
+  LDFLAGS += $(BOOST_TEST_LIBS)
+endif
+
+#############################################################################
+# MISC
+#############################################################################
+
+LD = $(CXX)
+MKDIR = mkdir -p
+
+# Only used on win32 for the app icon
+WINDRES ?= windres
+
+# Build dir
+B = $(BUILD_DIR)/$(TARGET)
+
+# Verbosity
+V ?= 0
+ifeq ($(V), 1)
+  export echo_cmd = @:
+  export Q =
+else
+  export echo_cmd = @echo
+  export Q = @
+endif
+
+#############################################################################
+# PLATFORM-SPECIFIC SETUP
+#############################################################################
+
+# Linux
+ifeq ($(PLATFORM), linux)
+
+  BINEXT =
+  DLLEXT = .so
+
+  ifeq ($(BUILD_MODULE), 1)
+    LDFLAGS += -shared
+  endif
+
+  CFLAGS += -pthread
+  LDFLAGS += -ldl -lm -lrt -pthread
+
+# Mac OS X
+else ifeq ($(PLATFORM), darwin)
+
+  BINEXT =
+  DLLEXT = .dylib
+
+  ifeq ($(BUILD_MODULE), 1)
+    LDFLAGS += -dynamiclib
+  else
+    CFLAGS += -mdynamic-no-pic
+  endif
+
+# Windows (MinGW)
+else ifeq ($(PLATFORM), mingw32)
+
+  BINEXT = .exe
+  DLLEXT = .dll
+
+  CFLAGS += -mms-bitfields
+  LDFLAGS += -lws2_32 -lwinmm
+
+  ifeq ($(BUILD_MODULE), 1)
+    LDFLAGS += -shared
+  endif
+
+  # libmingw32 must be linked in before libSDLmain
+  ifeq ($(TARGET), game)
+    LDFLAGS := -mwindows -lmingw32 $(LDFLAGS)
+  else ifeq ($(TARGET), editor)
+    LDFLAGS += -mwindows
+  endif
+
+# *BSD
+else ifneq ($(findstring $(PLATFORM), bsd), )
+
+  BINEXT =
+  DLLEXT = .so
+
+  ifeq ($(BUILD_MODULE), 1)
+    LDFLAGS += -shared
+  endif
+
+  CFLAGS += -pthread
+  LDFLAGS += -lm -pthread
+
+endif
+
+#############################################################################
+# SOURCE FILES
+#############################################################################
+
+CORE_SRC = \
+  src/Core/Thread/ThreadPool.cpp \
+  src/Core/Command.cpp \
+  src/Core/Console.cpp \
+  src/Core/Cvar.cpp \
+  src/Core/Filesystem/Filesystem.cpp \
+  src/Core/Init.cpp \
+  src/Core/Log.cpp \
+  src/Core/Memory/Memory.cpp \
+  src/Core/Memory/Pool.cpp \
+  src/Core/Memory/Virtual.cpp \
+  src/Core/Print.cpp \
+  src/Core/Random.cpp \
+  src/Core/Terminal.cpp \
+  src/Core/Unix.cpp \
+  src/Core/Win32.cpp
+
+SERVER_SRC = \
+  src/Server/Server.cpp
+
+EDITOR_SRC = \
+  src/Editor/Editor.cpp \
+  src/Editor/MainWindow.cpp \
+  src/Editor/RenderCanvas.cpp
+
+TEST_SRC = \
+  src/Test/Geometry.cpp \
+  src/Test/Math.cpp \
+  src/Test/Test.cpp \
+  src/Test/Vector.cpp
+
+#############################################################################
+# MAIN TARGET
+#############################################################################
+
+ifeq ($(TARGET), server)
+  OBJS = $(CORE_SRC) $(SERVER_SRC)
+else ifeq ($(TARGET), editor)
+  OBJS = $(CORE_SRC) $(EDITOR_SRC)
+else ifeq ($(TARGET), test)
+  OBJS = $(TEST_SRC)
+endif
+
+# Get the output filenames
+OBJS := $(addsuffix .o, $(addprefix $(B)/, $(basename $(OBJS))))
+
+# Run tests after compiling
+ifeq ($(TARGET), test)
+.PHONY: test
+test: $(B)/test$(BINEXT)
+	@-$(B)/test$(BINEXT) -l message
+endif
+
+$(B)/$(TARGET)$(BINEXT): $(OBJS)
+	$(echo_cmd) "LD $@"
+	@$(MKDIR) $(dir $@)
+	$(Q)$(LD) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
+
+#############################################################################
+# CONFIG.H
+#############################################################################
+
+$(B)/Config.h: config.sh
+	$(echo_cmd) "CONFIG Config.h"
+	@$(MKDIR) $(dir $@)
+	$(Q)sh config.sh $(CXX) $(CFLAGS) $(DFLAGS) $(LDFLAGS) > $@
+
+#############################################################################
+# PRECOMPILED HEADER
+#############################################################################
+
+$(OBJS): $(B)/Main.h.gch
+$(B)/Main.h.gch: src/Main.h $(B)/Config.h
+	$(echo_cmd) "PCH Main.h"
+	@$(MKDIR) $(dir $@)
+	$(Q)$(CXX) -x c++-header -MMD -MP -MT $@ -MF $(B)/Main.h.d $(CFLAGS) $(DFLAGS) -o $@ -c $<
+
+# Check that the precompiled header is still valid
+ifneq ($(shell B=$(B) sh pchtest.sh $(CFLAGS) $(DFLAGS)), 0)
+.PHONY: $(B)/Main.h.gch
+endif
+
+#############################################################################
+# COMPILE COMMANDS
+#############################################################################
+
+define DO_CXX
+	$(echo_cmd) "CXX $<"
+	@$(MKDIR) $(dir $@)
+	$(Q)$(CXX) -MMD -MP -DVERSION=\"$(VERSION)\" -include $(B)/Main.h $(DFLAGS) $(CFLAGS) -o $@ -c $<
+endef
+
+define DO_WINDRES
+	$(echo_cmd) "WINDRES $<"
+	@$(MKDIR) $(dir $@)
+	$(Q)$(WINDRES) -DVERSION=\"$(VERSION)\" $(DFLAGS) -i $< -o $@
+endef
+
+#############################################################################
+# BUILD RULES
+#############################################################################
+
+$(B)/src/Core/%.o: src/Core/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Core/Math/%.o: src/Core/Math/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Core/Mem/%.o: src/Core/Mem/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Core/Thread/%.o: src/Core/Thread/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Server/%.o: src/Server/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Editor/%.o: src/Editor/%.cpp
+	$(DO_CXX)
+
+$(B)/src/Test/%.o: src/Test/%.cpp
+	$(DO_CXX)
+
+#############################################################################
+# DEPENDENCIES
+#############################################################################
+
+OBJS_D = $(filter %.d, $(OBJS:%.o=%.d)) $(B)/Main.h.d
+-include $(OBJS_D)
+
+# Make stuff depend on version
+$(B)/src/Core/Init.o: $(VERSION_DEP)
+
+.PHONY: $(OBJS_D)
